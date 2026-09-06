@@ -13,6 +13,13 @@ services:
       # Extra channels for the poster card (comma separated)
       - EXTRA_CHANNELS=-1002689890343,-1002377422812
 
+      # --- MongoDB (episode/quality state survives container rebuilds) ---
+      # SECURITY: do NOT commit real credentials. Put the real URI in a local
+      # .env file (already git-ignored) as MONGO_URI=... and it is read here.
+      - MONGO_URI=${MONGO_URI}
+      - MONGO_DB=animexin
+      - MONGO_COLL=episodes
+
       - TZ=Asia/Jakarta
       - SCHEDULE_TIME=17:00
 

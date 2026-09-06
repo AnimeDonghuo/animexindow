@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+processed_posts.json
+channels.json
+thumb.jpg
+poster.jpg
+raw_source.mp4
+temp_*.mp4
+__pycache__/

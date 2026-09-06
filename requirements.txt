@@ -3,3 +3,5 @@ tgcrypto==1.2.5
 requests==2.31.0
 beautifulsoup4==4.12.3
 Pillow==10.4.0
+pymongo[srv]==4.8.0
+dnspython==2.6.1

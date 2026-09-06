@@ -28,6 +28,8 @@ EXTRA_CHANNELS = [
 ]
 THUMB_URL = os.environ.get("THUMB_URL", "https://i.ibb.co/KjTqgMkS/x.jpg")
 SITE_URL = os.environ.get("SITE_URL", "https://animexin.dev/")
+from urllib.parse import urlparse as _urlparse
+SITE_HOST = _urlparse(SITE_URL).netloc.replace("www.", "")
 DB_FILE = os.environ.get("DB_FILE", "processed_posts.json")
 SCHEDULE_TIME = os.environ.get("SCHEDULE_TIME", "17:00")
 
@@ -73,17 +75,69 @@ EDIT_INTERVAL = float(os.environ.get("EDIT_INTERVAL", "12"))  # seconds between 
 app = Client("animexin_pro_v5", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
-# --- DATABASE ---
+# --- DATABASE (MongoDB with JSON fallback) ---
+# Document schema, one per episode:
+#   {_id: <episode url>, title: str, done: [quality,...], no_link: bool}
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+MONGO_DB = os.environ.get("MONGO_DB", "animexin")
+MONGO_COLL = os.environ.get("MONGO_COLL", "episodes")
+
+_mongo = None
+_mongo_retry_at = 0.0     # don't hammer a dead server on every call
+
+
+def get_mongo():
+    """Return the episodes collection, or None if Mongo is unavailable.
+    Falls back to the local JSON file so the bot never dies on a DB outage."""
+    global _mongo, _mongo_retry_at
+    if _mongo is not None:
+        return _mongo
+    if not MONGO_URI:
+        return None
+    if time.time() < _mongo_retry_at:   # cached failure, retry later
+        return None
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000,
+                             connectTimeoutMS=8000, retryWrites=True)
+        client.admin.command("ping")
+        _mongo = client[MONGO_DB][MONGO_COLL]
+        print(f"[DB] Connected to MongoDB ({MONGO_DB}.{MONGO_COLL})")
+        return _mongo
+    except Exception as e:
+        _mongo_retry_at = time.time() + 300   # back off 5 minutes
+        print(f"[DB] MongoDB unavailable ({type(e).__name__}) -> using {DB_FILE}, "
+              f"retrying in 5min")
+        return None
+
+
+def _norm(url):
+    """Canonical key so the same episode is never stored twice."""
+    return (url or "").strip().rstrip("/") + "/"
+
+
 def load_db():
-    """DB schema: {url: {"title": str, "done": [quality, ...], "no_link": bool}}
-    Old format (a plain list of urls) is migrated automatically."""
+    """Load all episode state as {url: {...}}."""
+    coll = get_mongo()
+    if coll is not None:
+        try:
+            db = {}
+            for doc in coll.find({}):
+                url = doc.get("_id")
+                db[url] = {"title": doc.get("title", ""),
+                           "done": list(doc.get("done", [])),
+                           "no_link": bool(doc.get("no_link", False))}
+            return db
+        except Exception as e:
+            print(f"[DB] Mongo read failed: {e} -> falling back to file")
+
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r") as f:
                 data = json.load(f)
-            if isinstance(data, list):  # migrate legacy format
-                return {u: {"title": "", "done": list(all_qualities()), "no_link": False}
-                        for u in data}
+            if isinstance(data, list):  # migrate legacy list-of-urls format
+                return {_norm(u): {"title": "", "done": list(all_qualities()),
+                                   "no_link": False} for u in data}
             if isinstance(data, dict):
                 return data
         except Exception:
@@ -92,6 +146,7 @@ def load_db():
 
 
 def entry_for(db, url):
+    url = _norm(url)
     e = db.setdefault(url, {"title": "", "done": [], "no_link": False})
     e.setdefault("done", [])
     e.setdefault("no_link", False)
@@ -106,14 +161,137 @@ def missing_qualities(db, url):
 
 
 def is_complete(db, url):
-    return url in db and not missing_qualities(db, url)
+    return _norm(url) in db and not missing_qualities(db, url)
 
 
-def save_db(data):
+def mark_done(db, url, quality):
+    """Record one successful upload immediately (crash-safe)."""
+    e = entry_for(db, url)
+    if quality not in e["done"]:
+        e["done"].append(quality)
+    save_entry(url, e)
+
+
+def save_entry(url, entry):
+    """Persist a single episode - used after every successful upload."""
+    coll = get_mongo()
+    if coll is not None:
+        try:
+            coll.update_one({"_id": _norm(url)}, {"$set": {
+                "title": entry.get("title", ""),
+                "done": list(entry.get("done", [])),
+                "no_link": bool(entry.get("no_link", False)),
+            }}, upsert=True)
+            return
+        except Exception as e:
+            print(f"[DB] Mongo write failed: {e}")
+    _save_file_db_entry(url, entry)
+
+
+def _save_file_db_entry(url, entry):
+    data = {}
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+    data[_norm(url)] = entry
+    _write_file_db(data)
+
+
+def _write_file_db(data):
     tmp = DB_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, DB_FILE)
+
+
+def save_db(data):
+    """Persist the whole map."""
+    coll = get_mongo()
+    if coll is not None:
+        try:
+            for url, entry in data.items():
+                coll.update_one({"_id": _norm(url)}, {"$set": {
+                    "title": entry.get("title", ""),
+                    "done": list(entry.get("done", [])),
+                    "no_link": bool(entry.get("no_link", False)),
+                }}, upsert=True)
+            return
+        except Exception as e:
+            print(f"[DB] Mongo bulk write failed: {e} -> writing {DB_FILE}")
+    _write_file_db(data)
+
+
+def clear_db():
+    coll = get_mongo()
+    if coll is not None:
+        try:
+            coll.delete_many({})
+        except Exception as e:
+            print(f"[DB] Mongo clear failed: {e}")
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+
+# --- CHANNEL REGISTRY (persisted in Mongo, falls back to a JSON file) ---
+CHANNELS_FILE = os.environ.get("CHANNELS_FILE", "channels.json")
+_CHAN_DOC = "__channels__"
+
+
+def _chan_coll():
+    coll = get_mongo()
+    if coll is None:
+        return None
+    try:
+        return coll.database["config"]
+    except Exception:
+        return None
+
+
+def load_channels():
+    """Ordered list of channel ids to upload to. CHANNEL_ID is always first."""
+    ids = []
+    c = _chan_coll()
+    if c is not None:
+        try:
+            doc = c.find_one({"_id": _CHAN_DOC})
+            if doc:
+                ids = [int(x) for x in doc.get("ids", [])]
+        except Exception as e:
+            print(f"[DB] channel read failed: {e}")
+    if not ids and os.path.exists(CHANNELS_FILE):
+        try:
+            with open(CHANNELS_FILE) as f:
+                ids = [int(x) for x in json.load(f)]
+        except Exception:
+            ids = []
+    if not ids:                       # first run: seed from env
+        ids = [CHANNEL_ID] + EXTRA_CHANNELS
+
+    out = []
+    for i in [CHANNEL_ID] + ids:      # primary always first, de-duplicated
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def save_channels(ids):
+    ids = [int(i) for i in ids]
+    c = _chan_coll()
+    if c is not None:
+        try:
+            c.update_one({"_id": _CHAN_DOC}, {"$set": {"ids": ids}}, upsert=True)
+        except Exception as e:
+            print(f"[DB] channel write failed: {e}")
+    try:
+        with open(CHANNELS_FILE, "w") as f:
+            json.dump(ids, f)
+    except Exception:
+        pass
 
 
 # --- SAFE EDIT (fixes MESSAGE_NOT_MODIFIED spam) ---
@@ -529,8 +707,7 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
             # Record it and stay quiet so repeated /chk runs don't spam.
             first_time = not entry.get("no_link")
             entry["no_link"] = True
-            if own_db:
-                save_db(db)
+            save_entry(ep_url, entry)
             if first_time:
                 print(f"[Skip] No Mediafire link yet: {base_title}")
             await safe_edit(status_msg,
@@ -540,13 +717,14 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
 
         # A link exists now, so clear any previous no-link marker.
         entry["no_link"] = False
+        save_entry(ep_url, entry)
 
         if announce:
             poster_url = find_poster_url(soup)
             poster = fetch_image(poster_url, poster_file) if poster_url else None
             caption = (f"🎬 **{base_title}**\n✅ **English Subtitle**\n"
                        f"📤 Uploading: {', '.join(wanted)}")
-            for cid in [CHANNEL_ID] + EXTRA_CHANNELS:
+            for cid in load_channels():
                 await send_poster_card(cid, poster, caption)
 
         direct = mediafire_direct(mf_url)
@@ -617,22 +795,34 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
             size_mb = os.path.getsize(upload_path) / 1048576
             tag = "Original" if upload_path == source_file else "Encoded"
             print(f"[{tag}] {q} -> {size_mb:.1f}MB")
+            caption = (f"🎬 **{base_title}**\n🔥 Quality: **{q}**  •  "
+                       f"`{size_mb:.0f}MB`\n✅ **English Subtitle**")
             try:
-                await app.send_document(
-                    chat_id=CHANNEL_ID,
+                # Upload the bytes ONCE, then copy to the other channels using
+                # the returned file_id -- re-uploading per channel would waste
+                # hours of bandwidth on a 1 vCPU VPS.
+                targets = load_channels()
+                sent = await app.send_document(
+                    chat_id=targets[0],
                     document=upload_path,
                     thumb=thumb if os.path.exists(thumb) else None,
                     file_name=f"{base_title} Eng Sub [{q}].mp4",
-                    caption=f"🎬 **{base_title}**\n🔥 Quality: **{q}**  •  "
-                            f"`{size_mb:.0f}MB`\n✅ **English Subtitle**",
+                    caption=caption,
                     progress=update_progress_msg,
                     progress_args=(status_msg, base_title, f"📤 **Uploading {q}**"),
                 )
+                file_id = sent.document.file_id if sent and sent.document else None
+                for cid in targets[1:]:
+                    try:
+                        if file_id:
+                            await app.send_document(cid, file_id, caption=caption)
+                        await asyncio.sleep(1)
+                    except Exception as ce:
+                        print(f"[Copy] {q} -> {cid} failed: {ce}")
                 uploaded.append(q)
-                if q not in entry["done"]:
-                    entry["done"].append(q)
-                if own_db:
-                    save_db(db)   # persist after each success so a crash resumes
+                # Persist this quality right away so a crash/restart resumes
+                # exactly here instead of re-uploading what already succeeded.
+                mark_done(db, ep_url, q)
             except Exception as e:
                 print(f"[Upload] {q} failed: {e}")
                 failed.append(q)
@@ -675,16 +865,61 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
 
 
 # --- SITE POLLING ---
+# Episode permalinks look like /<slug>-episode-<n>-...-sub/ . Series/archive
+# pages (/anime/..., /genres/..., ?page=) must never be treated as episodes.
+EPISODE_RE = re.compile(r"/[^/]*episode[^/]*/?$", re.I)
+NON_EPISODE_RE = re.compile(
+    r"/(anime|genres?|seasons?|studio|schedule|page|tag|category|author|type)/", re.I)
+
+
+def looks_like_episode(url):
+    if not url or not url.startswith("http"):
+        return False
+    if SITE_HOST and SITE_HOST not in url:
+        return False              # off-site (facebook/telegram share buttons)
+    if NON_EPISODE_RE.search(url):
+        return False
+    if "#" in url or "?" in url:
+        return False
+    return bool(EPISODE_RE.search(url))
+
+
 def fetch_site_links():
+    """Collect episode permalinks from the homepage.
+
+    The old code relied on a single hardcoded selector (".utao .itao a").
+    AnimeXin's markup does not contain ".itao", so it silently returned zero
+    links and /chk always reported "everything is up to date". We now try the
+    known containers and then fall back to scanning every anchor, filtering by
+    URL shape instead of by CSS class.
+    """
     res = requests.get(SITE_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
     soup = BeautifulSoup(res.text, "html.parser")
-    posts = soup.select(".utao .itao a") or soup.select("article a[href]")
+
+    anchors = []
+    for sel in (".listupd a[href]", ".utao a[href]", ".uta a[href]",
+                ".excstf a[href]", "article a[href]", ".bsx a[href]"):
+        anchors.extend(soup.select(sel))
+    if not anchors:
+        anchors = soup.select("a[href]")
+
     seen, out = set(), []
-    for p in posts:
-        link = p.get("href")
-        if link and link not in seen:
+    for a in anchors:
+        link = (a.get("href") or "").strip().rstrip("/") + "/"
+        if looks_like_episode(link) and link not in seen:
             seen.add(link)
             out.append(link)
+
+    if not out:   # last resort: scan the whole page
+        for a in soup.select("a[href]"):
+            link = (a.get("href") or "").strip().rstrip("/") + "/"
+            if looks_like_episode(link) and link not in seen:
+                seen.add(link)
+                out.append(link)
+
+    print(f"[Polling] Found {len(out)} episode link(s) on the homepage")
+    if not out:
+        print("[Polling] WARNING: no episode links parsed - site layout may have changed")
     return out
 
 
@@ -792,25 +1027,110 @@ async def chklink_command(c, m):
     save_db(db)
 
 
-@app.on_message(filters.command("force"))
-async def force_command(c, m):
-    """Re-upload every quality for a link, ignoring what is already done."""
+@app.on_message(filters.command(["fupload", "force"]))
+async def fupload_command(c, m):
+    """/fupload <url> - re-upload EVERY quality, even ones already done."""
     urls = URL_RE.findall(m.text or "")
     if not urls:
-        await m.reply("Usage: `/force <url>`")
+        await m.reply("Usage: `/fupload <episode url>`\n"
+                      "Re-uploads every quality, ignoring what was already done.")
         return
     db = load_db()
-    url = urls[0].rstrip(").,")
-    entry_for(db, url)["done"] = []
-    msg = await m.reply("⚙️ **Force re-uploading all qualities...**")
+    url = _norm(urls[0].rstrip(").,"))
+    entry = entry_for(db, url)
+    entry["done"] = []          # wipe history so nothing is skipped
+    entry["no_link"] = False
+    save_entry(url, entry)
+    msg = await m.reply(f"⚙️ **Force re-uploading ALL qualities**\n"
+                        f"`{', '.join(all_qualities())}`")
     await run_task(url, msg, db=db, only_missing=False)
-    save_db(db)
+
+
+@app.on_message(filters.command("channels"))
+async def channels_command(c, m):
+    ids = load_channels()
+    lines = ["📡 **Active upload channels**"]
+    for i, cid in enumerate(ids):
+        try:
+            chat = await app.get_chat(cid)
+            name = chat.title or str(cid)
+        except Exception:
+            name = "(cannot access - is the bot an admin there?)"
+        lines.append(f"{'⭐' if i == 0 else '•'} `{cid}` — {name}")
+    lines.append("\n⭐ = primary (files are uploaded here, then copied)")
+    await m.reply("\n".join(lines))
+
+
+@app.on_message(filters.command("addchannel"))
+async def addchannel_command(c, m):
+    if len(m.command) < 2:
+        await m.reply("Usage: `/addchannel -1001234567890`")
+        return
+    try:
+        cid = int(m.command[1])
+    except ValueError:
+        await m.reply("❌ Channel id must be a number like `-1001234567890`.")
+        return
+
+    ids = load_channels()
+    if cid in ids:
+        await m.reply(f"ℹ️ `{cid}` is already in the list.")
+        return
+    try:
+        chat = await app.get_chat(cid)
+        title = chat.title or str(cid)
+    except Exception as e:
+        await m.reply(f"❌ Cannot access `{cid}`: {e}\n"
+                      f"Add the bot as an **admin** in that channel first.")
+        return
+
+    ids.append(cid)
+    save_channels(ids)
+    await m.reply(f"✅ Added **{title}** (`{cid}`).\nNow uploading to {len(ids)} channel(s).")
+
+
+@app.on_message(filters.command("removechannel"))
+async def removechannel_command(c, m):
+    if len(m.command) < 2:
+        await m.reply("Usage: `/removechannel -1001234567890`")
+        return
+    try:
+        cid = int(m.command[1])
+    except ValueError:
+        await m.reply("❌ Channel id must be a number.")
+        return
+    if cid == CHANNEL_ID:
+        await m.reply("❌ Cannot remove the primary channel (set `CHANNEL_ID` to change it).")
+        return
+    ids = load_channels()
+    if cid not in ids:
+        await m.reply(f"ℹ️ `{cid}` is not in the list.")
+        return
+    ids = [i for i in ids if i != cid]
+    save_channels(ids)
+    await m.reply(f"🗑️ Removed `{cid}`.\nNow uploading to {len(ids)} channel(s).")
+
+
+@app.on_message(filters.command(["start", "help"]))
+async def start_command(c, m):
+    await m.reply(
+        "🤖 **Animexin Multi-Channel Bot is running!**\n\n"
+        "**Commands:**\n"
+        "• `/chk` — Manual site update check\n"
+        "• `/chk <link>` — Retry **only** the qualities that failed\n"
+        "• `/chklink <link>` — Process a specific link\n"
+        "• `/fupload <link>` — Re-upload **all** qualities (ignores history)\n"
+        "• `/channels` — View all active upload channels\n"
+        "• `/addchannel <id>` — Add a channel\n"
+        "• `/removechannel <id>` — Remove a channel\n"
+        "• `/status` — Queue, disk and encoder info\n"
+        "• `/re_upload` — Clear the database and re-check everything"
+    )
 
 
 @app.on_message(filters.command("re_upload"))
 async def reupload_command(c, m):
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    clear_db()
     await trigger_manual_check(await m.reply("🗑️ **Database cleared. Re-checking...**"))
 
 
