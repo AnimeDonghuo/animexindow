@@ -6,6 +6,7 @@ import requests
 import time
 import re
 import shutil
+import uuid
 import subprocess
 import datetime
 from bs4 import BeautifulSoup
@@ -31,6 +32,8 @@ SITE_URL = os.environ.get("SITE_URL", "https://animexin.dev/")
 from urllib.parse import urlparse as _urlparse
 SITE_HOST = _urlparse(SITE_URL).netloc.replace("www.", "")
 DB_FILE = os.environ.get("DB_FILE", "processed_posts.json")
+# Scratch space for downloads/encodes. Each episode gets its own subfolder.
+WORK_ROOT = os.environ.get("WORK_ROOT", "work")
 SCHEDULE_TIME = os.environ.get("SCHEDULE_TIME", "17:00")
 
 # Qualities that get re-encoded (comma separated heights).
@@ -765,11 +768,34 @@ async def encode_to_fit(input_f, output_f, msg, title, duration, has_audio,
 
 
 # --- MAIN TASK ---
+# Only ONE episode may be processed at a time. Two overlapping runs (e.g. the
+# scheduler firing while you run /chk) used to share the same hardcoded
+# "raw_source.mp4", so whichever finished first deleted the other's source
+# mid-encode -> "FileNotFoundError: raw_source.mp4". A single worker is also
+# what we want on a 1 vCPU box: two parallel encodes just halve each other.
+_task_lock = asyncio.Lock()
+
+
 async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True):
     """Process one episode. Only uploads qualities not already recorded as done,
     so re-running /chk on the same link retries just the failures."""
-    source_file = "raw_source.mp4"
-    poster_file = "poster.jpg"
+    if _task_lock.locked():
+        await safe_edit(status_msg,
+                        "⏳ **Another episode is being processed.**\n"
+                        "Queued - this will start automatically when it finishes.",
+                        force=True)
+    async with _task_lock:
+        return await _run_task_inner(ep_url, status_msg, db, only_missing, announce)
+
+
+async def _run_task_inner(ep_url, status_msg, db, only_missing, announce):
+    # Unique per-run filenames so nothing can ever collide or be deleted by
+    # another run, even if a future change allows concurrency again.
+    run_id = uuid.uuid4().hex[:8]
+    work_dir = os.path.join(WORK_ROOT, run_id)
+    os.makedirs(work_dir, exist_ok=True)
+    source_file = os.path.join(work_dir, "raw_source.mp4")
+    poster_file = os.path.join(work_dir, "poster.jpg")
     own_db = db is None
     if own_db:
         db = load_db()
@@ -830,6 +856,12 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
                     await update_progress_msg(curr, total, status_msg, base_title,
                                               "📥 **Downloading English Source**")
 
+        if not os.path.exists(source_file) or os.path.getsize(source_file) < 100_000:
+            await safe_edit(status_msg,
+                            f"❌ **Download failed** (empty or missing file):\n{base_title}",
+                            force=True)
+            return False
+
         duration, src_height, has_audio = probe(source_file)
         if duration <= 0:
             await safe_edit(status_msg, f"❌ Source is not a valid video:\n{base_title}",
@@ -854,7 +886,7 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
             if src_height and h > src_height:
                 print(f"Skipping {q}: source is only {src_height}p")
                 continue
-            to_encode.append((q, f"temp_{q}.mp4"))
+            to_encode.append((q, os.path.join(work_dir, f"temp_{q}.mp4")))
 
         encoded_ok = set()
         if to_encode:
@@ -864,7 +896,7 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
         uploaded, failed = [], []
         for q in wanted:
             target = int(q.replace("p", ""))
-            temp_file = f"temp_{q}.mp4"
+            temp_file = os.path.join(work_dir, f"temp_{q}.mp4")
             upload_path = None
 
             if q == PASSTHROUGH_QUALITY and ENABLE_PASSTHROUGH:
@@ -953,18 +985,8 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
         if own_db:
             save_db(db)
         _forget(status_msg)
-        for f in (source_file, poster_file):
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-        for f in os.listdir("."):
-            if f.startswith("temp_") and f.endswith(".mp4"):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+        # Remove only this run's own working directory.
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # --- SITE POLLING ---
@@ -1367,6 +1389,20 @@ async def status_command(c, m):
 async def start_bot():
     await app.start()
     print("Bot starting up...")
+    # Clear scratch left behind by a crash/restart mid-encode.
+    try:
+        if os.path.isdir(WORK_ROOT):
+            shutil.rmtree(WORK_ROOT, ignore_errors=True)
+        os.makedirs(WORK_ROOT, exist_ok=True)
+    except Exception as e:
+        print(f"[Startup] could not reset {WORK_ROOT}: {e}")
+    # Remove legacy scratch files from older versions.
+    for f in ("raw_source.mp4", "poster.jpg"):
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
     await report_update_result()
     asyncio.create_task(scheduler_loop())
     await idle()
