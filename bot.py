@@ -82,6 +82,14 @@ MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 MONGO_DB = os.environ.get("MONGO_DB", "animexin")
 MONGO_COLL = os.environ.get("MONGO_COLL", "episodes")
 
+# --- self-update ---
+REPO_DIR = os.environ.get("REPO_DIR", "/app")
+UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "arena/01a0749f-animexindow")
+UPDATE_LOG = os.path.join(REPO_DIR, "update.log")
+UPDATE_RESULT = os.path.join(REPO_DIR, "update_result.json")
+# Only these Telegram user ids may run /update (comma separated). Empty = anyone.
+ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x]
+
 _mongo = None
 _mongo_retry_at = 0.0     # don't hammer a dead server on every call
 
@@ -1124,8 +1132,113 @@ async def start_command(c, m):
         "• `/addchannel <id>` — Add a channel\n"
         "• `/removechannel <id>` — Remove a channel\n"
         "• `/status` — Queue, disk and encoder info\n"
-        "• `/re_upload` — Clear the database and re-check everything"
+        "• `/re_upload` — Clear the database and re-check everything\n"
+        "• `/update` — Pull latest code, rebuild, restart & clean old images\n"
+        "• `/updatelog` — Show the last update log"
     )
+
+
+def _is_admin(m):
+    return not ADMINS or (m.from_user and m.from_user.id in ADMINS)
+
+
+@app.on_message(filters.command("update"))
+async def update_command(c, m):
+    """Pull the newest code, rebuild the image, restart, prune old images."""
+    if not _is_admin(m):
+        await m.reply("⛔ You are not allowed to run this.")
+        return
+
+    script = os.path.join(REPO_DIR, "update.sh")
+    if not os.path.exists(script):
+        await m.reply(f"❌ `update.sh` not found in `{REPO_DIR}`.")
+        return
+    if not os.path.exists("/var/run/docker.sock"):
+        await m.reply(
+            "❌ The bot cannot reach Docker.\n\n"
+            "Add this to `docker-compose.yml` under the service and recreate once:\n"
+            "```\nvolumes:\n  - .:/app\n  - /var/run/docker.sock:/var/run/docker.sock\n```"
+        )
+        return
+
+    force = len(m.command) > 1 and m.command[1].lower() in ("force", "-f", "yes")
+    msg = await m.reply(
+        "🔄 **Updating...**\n"
+        "`git pull` → `docker build` → `restart` → `prune`\n\n"
+        "_The bot will go offline for a minute and report back when it returns._"
+        + ("\n⚠️ force mode: rebuilding even if unchanged" if force else "")
+    )
+
+    env = os.environ.copy()
+    env.update({
+        "REPO_DIR": REPO_DIR,
+        "UPDATE_BRANCH": UPDATE_BRANCH,
+        "UPDATE_LOG": UPDATE_LOG,
+        "UPDATE_RESULT": UPDATE_RESULT,
+        "UPDATE_CHAT": str(msg.chat.id),
+        "UPDATE_MSG_ID": str(msg.id),
+        "FORCE_UPDATE": "1" if force else "0",
+    })
+    if os.path.exists(UPDATE_RESULT):
+        try:
+            os.remove(UPDATE_RESULT)
+        except Exception:
+            pass
+
+    try:
+        os.chmod(script, 0o755)
+    except Exception:
+        pass
+
+    # setsid + full detach: the script recreates THIS container, so it must
+    # outlive the bot process instead of being killed together with it.
+    subprocess.Popen(
+        ["setsid", "bash", script],
+        cwd=REPO_DIR, env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print("[Update] detached updater started")
+
+
+@app.on_message(filters.command("updatelog"))
+async def updatelog_command(c, m):
+    if not _is_admin(m):
+        return
+    if not os.path.exists(UPDATE_LOG):
+        await m.reply("No update log yet.")
+        return
+    with open(UPDATE_LOG) as f:
+        tail = f.read()[-3500:]
+    await m.reply(f"```\n{tail}\n```")
+
+
+async def report_update_result():
+    """After a restart, tell the user how the update went."""
+    if not os.path.exists(UPDATE_RESULT):
+        return
+    try:
+        with open(UPDATE_RESULT) as f:
+            data = json.load(f)
+        os.remove(UPDATE_RESULT)
+    except Exception:
+        return
+
+    icon = "✅" if data.get("status") == "ok" else "❌"
+    text = f"{icon} **Update {'complete' if data.get('status') == 'ok' else 'failed'}**\n\n"
+    body = (data.get("msg") or "").strip()
+    if body:
+        text += f"```\n{body[:1500]}\n```"
+    if data.get("status") != "ok":
+        text += "\nRun `/updatelog` for the full log."
+
+    chat = data.get("chat")
+    try:
+        await app.send_message(int(chat) if chat else CHANNEL_ID, text)
+    except Exception as e:
+        print(f"[Update] could not report result: {e}")
 
 
 @app.on_message(filters.command("re_upload"))
@@ -1159,6 +1272,7 @@ async def status_command(c, m):
 async def start_bot():
     await app.start()
     print("Bot starting up...")
+    await report_update_result()
     asyncio.create_task(scheduler_loop())
     await idle()
     await app.stop()

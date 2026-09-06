@@ -5,6 +5,8 @@ services:
     restart: always
     volumes:
       - .:/app
+      # Lets /update rebuild + restart this container and prune old images.
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - API_ID=123456
       - API_HASH=your_api_hash_here
@@ -19,6 +21,13 @@ services:
       - MONGO_URI=${MONGO_URI}
       - MONGO_DB=animexin
       - MONGO_COLL=episodes
+
+      # --- self-update ---
+      - REPO_DIR=/app
+      - UPDATE_BRANCH=arena/01a0749f-animexindow
+      - COMPOSE_SERVICE=telegram_bot
+      # Telegram user ids allowed to run /update (comma separated, blank = all)
+      - ADMINS=
 
       - TZ=Asia/Jakarta
       - SCHEDULE_TIME=17:00

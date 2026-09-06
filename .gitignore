@@ -8,3 +8,5 @@ poster.jpg
 raw_source.mp4
 temp_*.mp4
 __pycache__/
+update.log
+update_result.json
