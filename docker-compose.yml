@@ -17,8 +17,13 @@ services:
       - SCHEDULE_TIME=17:00
 
       # --- 1 vCPU TUNING ---
-      # Only two qualities: 4 renditions on 1 vCPU cannot finish in time.
-      - QUALITIES=480p,720p
+      # Re-encoded ladder (1080p is NOT in here - see passthrough below)
+      - QUALITIES=360p,480p,720p
+      # 1080p is uploaded exactly as downloaded from the site (no CPU cost).
+      - ENABLE_PASSTHROUGH=1
+      - PASSTHROUGH_QUALITY=1080p
+      # ...unless the original is bigger than this, then it is shrunk to fit.
+      - PASSTHROUGH_MAX_GB=1.95
       # veryfast ~= half the file size of ultrafast for a little more CPU.
       - X264_PRESET=veryfast
       - CRF_360=28
