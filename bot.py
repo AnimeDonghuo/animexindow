@@ -637,6 +637,85 @@ async def encode_video(input_f, output_f, res_p, msg, title, duration, src_heigh
 
 
 
+# --- MULTI-OUTPUT ENCODER (one decode -> every quality) ---
+# Encoding each rendition in its own ffmpeg run means decoding the 1080p
+# source once PER quality. Decoding is ~40% of the work on a 1 vCPU box, so
+# three runs waste two full decodes. This does one decode, splits the frames
+# in the filter graph and writes every rendition in a single pass.
+# Output is byte-identical to the separate runs - same filters, same encoder
+# settings - so quality and file size are unchanged.
+async def encode_all(input_f, targets, msg, title, duration, has_audio):
+    """targets: [(quality_str, output_path), ...]  ->  set of qualities that
+    encoded successfully."""
+    if not targets:
+        return set()
+    if len(targets) == 1:
+        q, out = targets[0]
+        ok = await encode_video(input_f, out, q, msg, title, duration, None, has_audio)
+        return {q} if ok else set()
+
+    labels = []
+    chains = []
+    for i, (q, _) in enumerate(targets):
+        h = int(q.replace("p", ""))
+        lbl = f"v{i}"
+        labels.append(lbl)
+        chains.append(f"[s{i}]scale=trunc(oh*dar/2)*2:{h}:flags=bicubic,setsar=1[{lbl}]")
+
+    split_outs = "".join(f"[s{i}]" for i in range(len(targets)))
+    graph = f"[0:v]split={len(targets)}{split_outs};" + ";".join(chains)
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-progress", "pipe:1", "-stats_period", "5",
+        "-i", input_f, "-filter_complex", graph,
+    ]
+    for i, (q, out) in enumerate(targets):
+        h = int(q.replace("p", ""))
+        cmd += ["-map", f"[{labels[i]}]"]
+        if has_audio:
+            cmd += ["-map", "0:a:0?"]
+        cmd += [
+            "-c:v", "libx264", "-preset", X264_PRESET,
+            "-crf", str(CRF.get(h, "26")),
+            "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
+            "-g", "250", "-sc_threshold", "0",
+            "-max_muxing_queue_size", "1024",
+        ]
+        if has_audio:
+            cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", "2", "-ar", "44100"]
+        cmd += ["-movflags", "+faststart", "-y", out]
+
+    if FFMPEG_THREADS and FFMPEG_THREADS != "0":
+        cmd[1:1] = ["-threads", FFMPEG_THREADS]
+
+    qual_list = ", ".join(q for q, _ in targets)
+    print(f"[Encode] single-pass for {qual_list} (one decode)")
+    ok = await _run_ffmpeg(cmd, msg, title, duration,
+                           f"⚙️ **Encoding {qual_list}** _(single pass)_",
+                           targets[0][1])
+
+    done = set()
+    for q, out in targets:
+        if os.path.exists(out) and os.path.getsize(out) > 100_000:
+            done.add(q)
+        elif os.path.exists(out):
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+
+    if not ok and not done:
+        # Whole pass died - fall back to one-at-a-time so a single bad
+        # rendition cannot cost us all the others.
+        print("[Encode] single-pass failed, falling back to per-quality runs")
+        for q, out in targets:
+            if await encode_video(input_f, out, q, msg, title, duration, None, has_audio):
+                done.add(q)
+    return done
+
+
+
 # --- SIZE-CAPPED RE-ENCODE (for oversized 1080p passthrough) ---
 async def encode_to_fit(input_f, output_f, msg, title, duration, has_audio,
                         target_bytes, height=1080):
@@ -764,6 +843,24 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
         if not os.path.exists(thumb):
             fetch_image(THUMB_URL, thumb)
 
+        # --- ENCODE EVERYTHING IN ONE PASS FIRST ---
+        # Every re-encoded quality is produced by a single ffmpeg run so the
+        # 1080p source is decoded once instead of once per rendition.
+        to_encode = []
+        for q in wanted:
+            if q == PASSTHROUGH_QUALITY and ENABLE_PASSTHROUGH:
+                continue
+            h = int(q.replace("p", ""))
+            if src_height and h > src_height:
+                print(f"Skipping {q}: source is only {src_height}p")
+                continue
+            to_encode.append((q, f"temp_{q}.mp4"))
+
+        encoded_ok = set()
+        if to_encode:
+            encoded_ok = await encode_all(source_file, to_encode, status_msg,
+                                          base_title, duration, has_audio)
+
         uploaded, failed = [], []
         for q in wanted:
             target = int(q.replace("p", ""))
@@ -789,10 +886,8 @@ async def run_task(ep_url, status_msg, db=None, only_missing=True, announce=True
                         upload_path = temp_file
             else:
                 if src_height and target > src_height:
-                    print(f"Skipping {q}: source is only {src_height}p")
                     continue
-                if await encode_video(source_file, temp_file, q, status_msg,
-                                      base_title, duration, src_height, has_audio):
+                if q in encoded_ok:
                     upload_path = temp_file
 
             if not upload_path:
