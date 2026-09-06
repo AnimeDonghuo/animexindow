@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   telegram_bot:
     build: .
@@ -8,14 +6,40 @@ services:
     volumes:
       - .:/app
     environment:
-      # --- Put your variables here or set them directly in bot.py ---
       - API_ID=123456
       - API_HASH=your_api_hash_here
       - BOT_TOKEN=your_bot_token_here
       - CHANNEL_ID=-1003966911002
-      
-      # Set your target country's timezone so that 17:00 aligns with your 5:00 PM
+      # Extra channels for the poster card (comma separated)
+      - EXTRA_CHANNELS=-1002689890343,-1002377422812
+
       - TZ=Asia/Jakarta
-      
-      # Customize the exact execution time format "HH:MM" (Optional)
       - SCHEDULE_TIME=17:00
+
+      # --- 1 vCPU TUNING ---
+      # Only two qualities: 4 renditions on 1 vCPU cannot finish in time.
+      - QUALITIES=480p,720p
+      # veryfast ~= half the file size of ultrafast for a little more CPU.
+      - X264_PRESET=veryfast
+      - CRF_360=28
+      - CRF_480=27
+      - CRF_720=26
+      - AUDIO_BITRATE=96k
+      # 0 = let ffmpeg pick (on 1 vCPU that is effectively 1 anyway)
+      - FFMPEG_THREADS=0
+      # Kill ffmpeg only after 10 min of NO progress, not on a wall clock.
+      - FFMPEG_STALL_TIMEOUT=600
+      # Absolute ceiling = 25x the video duration (24min ep -> 10h max)
+      - FFMPEG_MAX_RT_FACTOR=25
+      - FFMPEG_MIN_DEADLINE=1800
+      # Seconds between Telegram progress edits (avoids flood + not-modified)
+      - EDIT_INTERVAL=12
+
+    # Keep the encoder from freezing the whole VPS (SSH stays responsive)
+    cpu_shares: 512
+    mem_limit: 900m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

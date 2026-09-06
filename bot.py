@@ -1,328 +1,611 @@
 import os
+import io
 import json
 import asyncio
 import requests
 import time
 import re
+import shutil
 import subprocess
 import datetime
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.errors import MessageNotModified, FloodWait
 
-# --- CONFIGURATION (ENVIRONMENT OR HARDCODED FALLBACK) ---
-API_ID = int(os.environ.get("API_ID", ))  # Put your API ID here
+try:
+    from PIL import Image
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+
+# --- CONFIGURATION ---
+API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash_here")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003966911002))
+EXTRA_CHANNELS = [
+    int(x) for x in os.environ.get("EXTRA_CHANNELS", "").replace(" ", "").split(",") if x
+]
 THUMB_URL = os.environ.get("THUMB_URL", "https://i.ibb.co/KjTqgMkS/x.jpg")
 SITE_URL = os.environ.get("SITE_URL", "https://animexin.dev/")
 DB_FILE = os.environ.get("DB_FILE", "processed_posts.json")
-SCHEDULE_TIME = os.environ.get("SCHEDULE_TIME", "17:00")  # 5:00 PM (local system time)
-# --------------------------------------------------------
+SCHEDULE_TIME = os.environ.get("SCHEDULE_TIME", "17:00")
+
+# Qualities to produce (comma separated heights). 1080p is off by default:
+# the AnimeXin sources are 1080p at best, so 1080p is a pointless re-encode
+# that eats hours of CPU on a 1 vCPU box.
+QUALITIES = [q.strip() for q in os.environ.get("QUALITIES", "480p,720p").split(",") if q.strip()]
+
+# x264 tuning for a weak VPS. veryfast is ~2-3x slower than ultrafast but
+# produces roughly HALF the file size at the same visual quality.
+X264_PRESET = os.environ.get("X264_PRESET", "veryfast")
+CRF = {  # per-height CRF: higher = smaller file
+    360: os.environ.get("CRF_360", "28"),
+    480: os.environ.get("CRF_480", "27"),
+    720: os.environ.get("CRF_720", "26"),
+    1080: os.environ.get("CRF_1080", "25"),
+}
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "96k")
+FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "0")  # 0 = let ffmpeg decide
+
+# Watchdog: kill ffmpeg only if it makes NO progress for this many seconds.
+# (The old code used a fixed wall-clock timeout, which killed perfectly
+#  healthy encodes on a slow VPS -> "FFmpeg timeout reached".)
+FFMPEG_STALL_TIMEOUT = int(os.environ.get("FFMPEG_STALL_TIMEOUT", "600"))
+# Absolute ceiling as a multiple of the video duration (realtime factor).
+FFMPEG_MAX_RT_FACTOR = float(os.environ.get("FFMPEG_MAX_RT_FACTOR", "25"))
+FFMPEG_MIN_DEADLINE = float(os.environ.get("FFMPEG_MIN_DEADLINE", "1800"))
+
+EDIT_INTERVAL = float(os.environ.get("EDIT_INTERVAL", "12"))  # seconds between edits
 
 app = Client("animexin_pro_v5", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
 
 # --- DATABASE ---
 def load_db():
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f: 
+            with open(DB_FILE, "r") as f:
                 return json.load(f)
         except Exception:
             return []
     return []
 
-def save_db(data):
-    with open(DB_FILE, "w") as f: 
-        json.dump(data, f)
 
-# --- PROGRESS BAR UI ---
-def get_progress_bar(current, total):
+def save_db(data):
+    tmp = DB_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, DB_FILE)
+
+
+# --- SAFE EDIT (fixes MESSAGE_NOT_MODIFIED spam) ---
+_last_text = {}   # message key -> last text we actually sent
+_last_time = {}   # message key -> last edit timestamp
+
+
+def _mkey(msg):
+    return (getattr(msg, "chat", None) and msg.chat.id, msg.id)
+
+
+async def safe_edit(msg, text, force=False):
+    """Edit a message only when the content actually changed and enough time
+    has passed. Silently ignores MESSAGE_NOT_MODIFIED instead of logging it."""
+    if msg is None:
+        return
+    key = _mkey(msg)
+    now = time.time()
+
+    if _last_text.get(key) == text:      # identical content -> Telegram would 400
+        return
+    if not force and now - _last_time.get(key, 0) < EDIT_INTERVAL:
+        return
+
+    _last_text[key] = text
+    _last_time[key] = now
     try:
-        pct = (current / total) * 100
-        completed = int(pct / 10)
-        bar = "🟢" * completed + "⚪" * (10 - completed)
-        return f"|{bar}| {pct:.1f}%"
-    except Exception:
-        return "|⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪| 0.0%"
+        await msg.edit_text(text)
+    except MessageNotModified:
+        pass
+    except FloodWait as e:
+        _last_time[key] = now + float(getattr(e, "value", 5))
+    except Exception as e:
+        print(f"[Edit] {type(e).__name__}: {e}")
+
+
+def _forget(msg):
+    key = _mkey(msg)
+    _last_text.pop(key, None)
+    _last_time.pop(key, None)
+
+
+# --- PROGRESS BAR ---
+def get_progress_bar(pct, filled="🟢"):
+    pct = max(0.0, min(100.0, pct))
+    n = int(pct / 10)
+    return f"|{filled * n}{'⚪' * (10 - n)}| {pct:.1f}%"
+
 
 async def update_progress_msg(current, total, msg, title, status_type):
-    now = time.time()
-    if not hasattr(update_progress_msg, "last_up"): 
-        update_progress_msg.last_up = 0
-    if now - update_progress_msg.last_up < 4: 
-        return 
-    update_progress_msg.last_up = now
-    
-    bar = get_progress_bar(current, total)
-    try:
-        await msg.edit(f"🎬 **{title}**\n\n{status_type}\n{bar}\n`{current/1024/1024:.1f}MB / {total/1024/1024:.1f}MB`")
-    except Exception: 
-        pass
+    pct = (current / total * 100) if total else 0
+    await safe_edit(
+        msg,
+        f"🎬 **{title}**\n\n{status_type}\n{get_progress_bar(pct)}\n"
+        f"`{current/1048576:.1f}MB / {total/1048576:.1f}MB`",
+    )
 
-# --- SMART NAMING ENGINE ---
+
+# --- NAMING ---
 def clean_page_title(soup):
     h1 = soup.find("h1")
     if h1:
         name = h1.text.strip()
-        name = re.split(r'Subtitle|Indonesia|English|Indo', name, flags=re.IGNORECASE)[0]
+        name = re.split(r"Subtitle|Indonesia|English|Indo", name, flags=re.IGNORECASE)[0]
         name = name.replace("Episode", "Ep").strip()
-        name = name.rstrip(',- ')
-        return name
+        return name.rstrip(",- ")
     return "Anime Episode"
 
-def safe_filename(name):
-    # Strip any characters that might break Linux terminal paths
-    return re.sub(r'[^a-zA-Z0-9\s\.\-\[\]\(\)]', '', name).strip()
 
-# --- MEDIAFIRE ENGLISH LINK FINDER ---
-def find_english_mediafire(soup):
-    all_links = soup.find_all('a', href=True)
-    mediafire_links = []
-    for link in all_links:
-        href = link['href']
-        if "mediafire.com" in href:
-            mediafire_links.append(href)
-    
-    if len(mediafire_links) >= 2:
-        print(f"Targeting English Mediafire: {mediafire_links[1]}")
-        return mediafire_links[1]
-    elif len(mediafire_links) == 1:
-        return mediafire_links[0]
+def safe_filename(name):
+    return re.sub(r"[^a-zA-Z0-9\s\.\-\[\]\(\)]", "", name).strip() or "Anime Episode"
+
+
+# --- POSTER (fixes 400 IMAGE_PROCESS_FAILED) ---
+def normalise_image(raw_bytes, out_path, max_side=1280, max_bytes=4 * 1024 * 1024):
+    """Telegram rejects webp/avif/CMYK/huge/oversized-ratio images with
+    IMAGE_PROCESS_FAILED. Re-encode everything to a plain baseline RGB JPEG."""
+    if not raw_bytes:
+        return None
+    if not PIL_OK:
+        # Without Pillow we can only trust real JPEGs.
+        if raw_bytes[:3] == b"\xff\xd8\xff":
+            with open(out_path, "wb") as f:
+                f.write(raw_bytes)
+            return out_path
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw_bytes))
+        im.load()
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+
+        w, h = im.size
+        if w < 20 or h < 20:
+            return None
+        # Telegram requires width+height <= 10000 and ratio <= 20
+        if max(w, h) / min(w, h) > 19:
+            return None
+        if max(w, h) > max_side:
+            scale = max_side / max(w, h)
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        for q in (85, 75, 65, 55, 45):
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=q, optimize=True, progressive=False)
+            if buf.tell() <= max_bytes:
+                break
+        with open(out_path, "wb") as f:
+            f.write(buf.getvalue())
+        return out_path
+    except Exception as e:
+        print(f"[Poster] cannot normalise image: {e}")
+        return None
+
+
+def fetch_image(url, out_path):
+    try:
+        r = requests.get(
+            url, timeout=25,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": SITE_URL},
+        )
+        r.raise_for_status()
+        if "text/html" in r.headers.get("Content-Type", ""):
+            return None
+        return normalise_image(r.content, out_path)
+    except Exception as e:
+        print(f"[Poster] download failed {url}: {e}")
+        return None
+
+
+def find_poster_url(soup):
+    for sel, attr in (
+        ('meta[property="og:image"]', "content"),
+        ('meta[name="twitter:image"]', "content"),
+        (".thumb img", "src"),
+        ("article img", "src"),
+        ("img", "src"),
+    ):
+        tag = soup.select_one(sel)
+        if tag and tag.get(attr):
+            return tag[attr]
     return None
 
-# --- ENCODING ENGINE ---
-async def encode_video(input_f, output_f, res_p, msg, title):
-    probe = subprocess.run([
-        'ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
-        '-of', 'default=noprint_wrappers=1:nokey=1', input_f
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    
+
+async def send_poster_card(chat_id, poster_path, caption):
+    """Never let a broken poster kill the post - fall back to plain text."""
+    if poster_path and os.path.exists(poster_path):
+        try:
+            await app.send_photo(chat_id, poster_path, caption=caption)
+            return True
+        except Exception as e:
+            print(f"[Poster] send_photo failed for {chat_id}: {e} -> text fallback")
     try:
-        duration = float(probe.stdout)
-    except Exception:
-        duration = 1.0  # Fallback duration to prevent division by zero
-    
-    res_val = res_p.replace("p", "")
+        await app.send_message(chat_id, caption, disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        print(f"[Poster] text fallback failed for {chat_id}: {e}")
+        return False
+
+
+# --- MEDIAFIRE ---
+def find_english_mediafire(soup):
+    links = [a["href"] for a in soup.find_all("a", href=True) if "mediafire.com" in a["href"]]
+    if len(links) >= 2:
+        print(f"Targeting English Mediafire: {links[1]}")
+        return links[1]
+    return links[0] if links else None
+
+
+def mediafire_direct(mf_url):
+    r = requests.get(mf_url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    soup = BeautifulSoup(r.text, "html.parser")
+    btn = soup.find("a", {"id": "downloadButton"})
+    if btn and btn.get("href", "").startswith("http"):
+        return btn["href"]
+    m = re.search(r'href="(https://download[^"]+)"', r.text)
+    if m:
+        return m.group(1)
+    raise RuntimeError("Could not resolve Mediafire direct link")
+
+
+# --- PROBE ---
+def probe(input_f):
+    """Return (duration_seconds, height, has_audio)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,height",
+             "-of", "json", input_f],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120,
+        ).stdout
+        data = json.loads(out or "{}")
+        dur = float(data.get("format", {}).get("duration") or 0) or 0.0
+        height, has_audio = 0, False
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                height = max(height, int(s.get("height") or 0))
+            if s.get("codec_type") == "audio":
+                has_audio = True
+        return dur, height, has_audio
+    except Exception as e:
+        print(f"[Probe] {e}")
+        return 0.0, 0, True
+
+
+# --- ENCODER ---
+async def encode_video(input_f, output_f, res_p, msg, title, duration, src_height, has_audio):
+    res_val = int(res_p.replace("p", ""))
+
     cmd = [
-        'ffmpeg', '-i', input_f,
-        '-vf', f'scale=-2:{res_val}',
-        '-c:v', 'libx264', '-crf', '24', '-preset', 'ultrafast',  # 'ultrafast' saves heavy VPS CPU cycles
-        '-threads', '1',  # Limit to 1 CPU thread to avoid VPS lockups
-        '-c:a', 'copy', output_f, '-y'
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-progress", "pipe:1", "-stats_period", "5",
+        "-i", input_f,
+        "-map", "0:v:0",
     ]
-    
-    # Custom non-blocking stdout stream read loop (replaces readline to prevent LimitOverrun crashes)
+    if has_audio:
+        cmd += ["-map", "0:a:0?"]
+    cmd += [
+        # Width is derived from the DISPLAY aspect ratio (dar), so anamorphic
+        # sources are converted to square pixels instead of coming out
+        # stretched; trunc(../2)*2 guarantees the mod-2 dimensions that
+        # libx264 + yuv420p require (odd sizes are what "break" the picture).
+        "-vf", f"scale=trunc(oh*dar/2)*2:{res_val}:flags=bicubic,setsar=1",
+        "-c:v", "libx264",
+        "-preset", X264_PRESET,
+        "-crf", str(CRF.get(res_val, "26")),
+        "-profile:v", "high", "-level", "4.0",
+        "-pix_fmt", "yuv420p",
+        "-g", "250", "-sc_threshold", "0",
+        "-threads", FFMPEG_THREADS,
+        "-max_muxing_queue_size", "1024",
+    ]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", "2", "-ar", "44100"]
+    cmd += ["-movflags", "+faststart", "-y", output_f]
+
     proc = await asyncio.create_subprocess_exec(
-        *cmd, 
-        stdout=asyncio.subprocess.PIPE, 
-        stderr=asyncio.subprocess.STDOUT
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    
-    buffer = ""
-    while True:
-        chunk = await proc.stdout.read(1024)
-        if not chunk: 
-            break
-        buffer += chunk.decode('utf-8', errors='ignore')
-        
-        while "\r" in buffer or "\n" in buffer:
-            r_idx = buffer.find("\r")
-            n_idx = buffer.find("\n")
-            split_idx = min(r_idx, n_idx) if (r_idx != -1 and n_idx != -1) else max(r_idx, n_idx)
-            
-            line = buffer[:split_idx].strip()
-            buffer = buffer[split_idx + 1:]
-            
-            if "time=" in line:
-                m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
-                if m:
-                    curr_time = int(m.group(1))*3600 + int(m.group(2))*60 + float(m.group(3))
-                    pct = (curr_time / duration) * 100
-                    bar = "" + "🟠" * int(pct/10) + "⚪" * (10 - int(pct/10))
-                    try: 
-                        await msg.edit(f"🎬 **{title}**\n\n⚙️ **Encoding {res_p}...**\n|{bar}| {pct:.1f}%")
-                    except Exception: 
+
+    started = time.time()
+    hard_deadline = started + max(FFMPEG_MIN_DEADLINE, duration * FFMPEG_MAX_RT_FACTOR)
+    last_progress = time.time()
+    out_time = 0.0
+    killed_reason = None
+
+    async def reader():
+        nonlocal out_time, last_progress
+        buf = b""
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.decode("utf-8", "ignore").strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        out_time = int(line.split("=", 1)[1]) / 1_000_000
+                        last_progress = time.time()
+                    except Exception:
                         pass
-                        
+                elif line.startswith("out_time="):
+                    m = re.match(r"out_time=(\d+):(\d+):([\d.]+)", line)
+                    if m:
+                        out_time = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        last_progress = time.time()
+
+    reader_task = asyncio.create_task(reader())
+
+    while proc.returncode is None:
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        if duration:
+            pct = min(99.9, out_time / duration * 100)
+            eta = ""
+            if out_time > 5:
+                speed = out_time / max(1e-3, time.time() - started)
+                if speed > 0:
+                    remain = int((duration - out_time) / speed)
+                    eta = f"\n⏳ ETA `{remain // 60}m {remain % 60}s`"
+            await safe_edit(
+                msg,
+                f"🎬 **{title}**\n\n⚙️ **Encoding {res_p}**\n"
+                f"{get_progress_bar(pct, '🟠')}{eta}",
+            )
+
+        if time.time() - last_progress > FFMPEG_STALL_TIMEOUT:
+            killed_reason = f"stalled for {FFMPEG_STALL_TIMEOUT}s"
+        elif time.time() > hard_deadline:
+            killed_reason = "exceeded hard deadline"
+        if killed_reason:
+            print(f"[FFmpeg] killing {res_p}: {killed_reason}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            break
+
     await proc.wait()
-    return os.path.exists(output_f)
+    reader_task.cancel()
+    err = b""
+    try:
+        err = await proc.stderr.read()
+    except Exception:
+        pass
+
+    ok = proc.returncode == 0 and os.path.exists(output_f) and os.path.getsize(output_f) > 100_000
+    if not ok:
+        print(f"[FFmpeg] {res_p} failed (rc={proc.returncode}, {killed_reason or 'error'}): "
+              f"{err.decode('utf-8', 'ignore')[-500:]}")
+        if os.path.exists(output_f):
+            try:
+                os.remove(output_f)
+            except Exception:
+                pass
+    return ok
+
 
 # --- MAIN TASK ---
 async def run_task(ep_url, status_msg):
     source_file = "raw_source.mp4"
+    poster_file = "poster.jpg"
     try:
-        res = requests.get(ep_url, timeout=20)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        base_title = clean_page_title(soup)
-        base_title = safe_filename(base_title)
-        
-        # 1. FIND THE SECOND MEDIAFIRE LINK (ENGLISH)
+        res = requests.get(ep_url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(res.text, "html.parser")
+        base_title = safe_filename(clean_page_title(soup))
+
+        # Poster card (best effort, never fatal)
+        poster_url = find_poster_url(soup)
+        poster = fetch_image(poster_url, poster_file) if poster_url else None
+        caption = f"🎬 **{base_title}**\n✅ **English Subtitle**\n📤 Uploading qualities: {', '.join(QUALITIES)}"
+        for cid in [CHANNEL_ID] + EXTRA_CHANNELS:
+            await send_poster_card(cid, poster, caption)
+
         mf_url = find_english_mediafire(soup)
         if not mf_url:
-            await status_msg.edit(f"❌ English Mediafire link not found for:\n{base_title}")
+            await safe_edit(status_msg, f"❌ English Mediafire link not found for:\n{base_title}", force=True)
             return False
 
-        # 2. Get direct download link
-        mf_res = requests.get(mf_url, timeout=20)
-        mf_soup = BeautifulSoup(mf_res.text, 'html.parser')
-        direct_download = mf_soup.find('a', {'id': 'downloadButton'})['href']
+        direct = mediafire_direct(mf_url)
 
-        # 3. Download Source File
-        with requests.get(direct_download, stream=True, timeout=60) as r:
+        # Download
+        with requests.get(direct, stream=True, timeout=(30, 300),
+                          headers={"User-Agent": "Mozilla/5.0"}) as r:
             r.raise_for_status()
-            total = int(r.headers.get('content-length', 0))
+            total = int(r.headers.get("content-length", 0))
             curr = 0
-            with open(source_file, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
+            with open(source_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
                     f.write(chunk)
                     curr += len(chunk)
-                    await update_progress_msg(curr, total, status_msg, base_title, "📥 **Downloading English Source**")
+                    await update_progress_msg(curr, total, status_msg, base_title,
+                                              "📥 **Downloading English Source**")
 
-        # 4. Process all qualities sequentially
-        for q in ["360p", "480p", "720p", "1080p"]:
-            final_filename = f"{base_title} Eng Sub [{q}].mp4"
+        duration, src_height, has_audio = probe(source_file)
+        if duration <= 0:
+            await safe_edit(status_msg, f"❌ Source file is not a valid video:\n{base_title}", force=True)
+            return False
+        print(f"[Source] {base_title}: {duration:.0f}s, {src_height}p, audio={has_audio}")
+
+        thumb = "thumb.jpg"
+        if not os.path.exists(thumb):
+            fetch_image(THUMB_URL, thumb)
+
+        uploaded = 0
+        for q in QUALITIES:
+            target = int(q.replace("p", ""))
+            # Never upscale: it only burns CPU and inflates file size.
+            if src_height and target > src_height:
+                print(f"Skipping {q}: source is only {src_height}p")
+                continue
+
             temp_file = f"temp_{q}.mp4"
-            
-            # Encode
-            encode_success = await encode_video(source_file, temp_file, q, status_msg, base_title)
-            if not encode_success:
+            if not await encode_video(source_file, temp_file, q, status_msg,
+                                      base_title, duration, src_height, has_audio):
                 print(f"Skipping upload for {q} due to encoding failure.")
                 continue
-            
-            # Thumbnail download
-            thumb = "thumb.jpg"
-            if not os.path.exists(thumb):
+
+            size_mb = os.path.getsize(temp_file) / 1048576
+            print(f"[Encoded] {q} -> {size_mb:.1f}MB")
+            try:
+                await app.send_document(
+                    chat_id=CHANNEL_ID,
+                    document=temp_file,
+                    thumb=thumb if os.path.exists(thumb) else None,
+                    file_name=f"{base_title} Eng Sub [{q}].mp4",
+                    caption=f"🎬 **{base_title}**\n🔥 Quality: **{q}**  •  `{size_mb:.0f}MB`\n"
+                            f"✅ **English Subtitle**",
+                    progress=update_progress_msg,
+                    progress_args=(status_msg, base_title, f"📤 **Uploading {q}**"),
+                )
+                uploaded += 1
+            except Exception as e:
+                print(f"[Upload] {q} failed: {e}")
+            finally:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            await asyncio.sleep(5)
+
+        await safe_edit(status_msg,
+                        f"{'✅' if uploaded else '⚠️'} **Process Finished:**\n{base_title}\n"
+                        f"Uploaded {uploaded}/{len(QUALITIES)} qualities.", force=True)
+        return uploaded > 0
+
+    except Exception as e:
+        print(f"[Task Error] {type(e).__name__}: {e}")
+        await safe_edit(status_msg, f"❌ **Error:** {type(e).__name__}: {e}", force=True)
+        return False
+    finally:
+        _forget(status_msg)
+        for f in (source_file, poster_file):
+            if os.path.exists(f):
                 try:
-                    with open(thumb, "wb") as f: 
-                        f.write(requests.get(THUMB_URL, timeout=15).content)
+                    os.remove(f)
+                except Exception:
+                    pass
+        for f in os.listdir("."):
+            if f.startswith("temp_") and f.endswith(".mp4"):
+                try:
+                    os.remove(f)
                 except Exception:
                     pass
 
-            # Upload
-            await app.send_document(
-                chat_id=CHANNEL_ID,
-                document=temp_file,
-                thumb=thumb if os.path.exists(thumb) else None,
-                file_name=final_filename,
-                caption=f"🎬 **{base_title}**\n🔥 Quality: **{q}**\n✅ **English Subtitle**",
-                progress=update_progress_msg,
-                progress_args=(status_msg, base_title, f"📤 **Uploading {q}**")
-            )
-            
-            # Delete temporary output file immediately to preserve disk space
-            if os.path.exists(temp_file): 
-                os.remove(temp_file)
-            await asyncio.sleep(5)  # Rest time between encoding passes
 
-        await status_msg.edit(f"✅ **Process Finished:**\n{base_title}")
-        return True
+# --- SITE POLLING ---
+def fetch_new_links(db):
+    res = requests.get(SITE_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    soup = BeautifulSoup(res.text, "html.parser")
+    posts = soup.select(".utao .itao a") or soup.select("article a[href]")
+    seen, out = set(), []
+    for p in posts:
+        link = p.get("href")
+        if link and link not in db and link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
 
-    except Exception as e:
-        await status_msg.edit(f"❌ **Error:** {str(e)}")
-        return False
-    finally:
-        # Guarantee cleanup of raw video file
-        if os.path.exists(source_file):
-            try: 
-                os.remove(source_file)
-            except Exception: 
-                pass
 
-# --- MANUAL CHECK HELPER ---
 async def trigger_manual_check(status_msg):
     db = load_db()
-    res = requests.get(SITE_URL, timeout=20)
-    soup = BeautifulSoup(res.text, 'html.parser')
-    posts = soup.select(".utao .itao a")
-    
-    processed_count = 0
-    for post in posts:
-        link = post['href']
-        if link not in db:
-            msg = await app.send_message(CHANNEL_ID, "🚀 **Auto-Check: New Update**")
-            success = await run_task(link, msg)
-            if success:
-                db.append(link)
-                save_db(db)
-                processed_count += 1
-                await asyncio.sleep(10)  # Safe cooldown between whole episodes
-                
-    if processed_count == 0:
-        await status_msg.edit("✅ **Site checked. Everything is up to date!**")
-    else:
-        await status_msg.edit(f"✅ **Manual Auto-Check complete! Processed {processed_count} posts.**")
+    processed = 0
+    for link in fetch_new_links(db):
+        print(f"[Polling] Processing: {link}")
+        msg = await app.send_message(CHANNEL_ID, "🚀 **Auto-Check: New Update**")
+        if await run_task(link, msg):
+            db.append(link)
+            save_db(db)
+            processed += 1
+            await asyncio.sleep(10)
+    await safe_edit(
+        status_msg,
+        "✅ **Site checked. Everything is up to date!**" if not processed
+        else f"✅ **Auto-Check complete! Processed {processed} posts.**",
+        force=True,
+    )
 
-# --- BACKGROUND AUTOMATION SCHEDULER ---
+
 async def scheduler_loop():
     print("[Scheduler] Background daemon initialized.")
-    await asyncio.sleep(10)  # Wait for Bot Startup
-    
+    await asyncio.sleep(10)
     while True:
         try:
             now = datetime.datetime.now()
-            target_h, target_m = map(int, SCHEDULE_TIME.split(":"))
-            
-            if now.hour == target_h and now.minute == target_m:
-                current_date = now.date()
-                # Ensure the daily scheduler only runs once during the matching 17:00 minute
-                if not hasattr(scheduler_loop, "last_run_date") or scheduler_loop.last_run_date != current_date:
-                    scheduler_loop.last_run_date = current_date
-                    print(f"[Scheduler] Running daily check at scheduled time: {SCHEDULE_TIME}")
-                    
+            th, tm = map(int, SCHEDULE_TIME.split(":"))
+            if now.hour == th and now.minute == tm:
+                today = now.date()
+                if getattr(scheduler_loop, "last_run_date", None) != today:
+                    scheduler_loop.last_run_date = today
+                    print(f"[Scheduler] Daily check at {SCHEDULE_TIME}")
                     db = load_db()
-                    res = requests.get(SITE_URL, timeout=20)
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    posts = soup.select(".utao .itao a")
-                    
-                    for post in posts:
-                        link = post['href']
-                        if link not in db:
-                            # Start processing sequentially
-                            msg = await app.send_message(CHANNEL_ID, f"📢 **Scheduler Trigger: New post detected at {SCHEDULE_TIME}!**")
-                            success = await run_task(link, msg)
-                            if success:
-                                db.append(link)
-                                save_db(db)
-                                await asyncio.sleep(15)  # Cooldown before processing another episode
-            
-            # Sleep 45 seconds to keep checking and prevent double-triggering in the same minute
+                    for link in fetch_new_links(db):
+                        msg = await app.send_message(CHANNEL_ID, "📢 **Scheduler: New post detected!**")
+                        if await run_task(link, msg):
+                            db.append(link)
+                            save_db(db)
+                            await asyncio.sleep(15)
             await asyncio.sleep(45)
         except Exception as e:
             print(f"[Scheduler Error] {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
 
-# --- COMMAND HANDLERS ---
+
+# --- COMMANDS ---
 @app.on_message(filters.command("chk"))
 async def chk_command(c, m):
-    msg = await m.reply("⚙️ **Starting Check Process...**")
-    await trigger_manual_check(msg)
+    await trigger_manual_check(await m.reply("⚙️ **Starting Check Process...**"))
+
 
 @app.on_message(filters.command("chklink"))
 async def chklink_command(c, m):
-    if len(m.command) < 2: 
+    if len(m.command) < 2:
         await m.reply("Usage: `/chklink <url>`")
         return
-    url = m.command[1]
-    msg = await m.reply("⚙️ **Manual Processing English Sub...**")
-    await run_task(url, msg)
+    await run_task(m.command[1], await m.reply("⚙️ **Manual Processing English Sub...**"))
+
 
 @app.on_message(filters.command("re_upload"))
 async def reupload_command(c, m):
-    if os.path.exists(DB_FILE): 
+    if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
-    msg = await m.reply("🗑️ **Database cleared. Triggering re-download auto-check...**")
-    await trigger_manual_check(msg)
+    await trigger_manual_check(await m.reply("🗑️ **Database cleared. Re-checking...**"))
 
-# --- START APP ---
+
+@app.on_message(filters.command("status"))
+async def status_command(c, m):
+    total, used, free = shutil.disk_usage(".")
+    await m.reply(
+        f"🧠 Qualities: `{', '.join(QUALITIES)}`\n"
+        f"⚙️ Preset: `{X264_PRESET}` • Threads: `{FFMPEG_THREADS}`\n"
+        f"💾 Disk free: `{free/1073741824:.1f} GB`\n"
+        f"📚 Processed posts: `{len(load_db())}`"
+    )
+
+
 async def start_bot():
     await app.start()
     print("Bot starting up...")
-    asyncio.create_task(scheduler_loop())  # Register background scheduler
+    asyncio.create_task(scheduler_loop())
     await idle()
     await app.stop()
+
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(start_bot())
