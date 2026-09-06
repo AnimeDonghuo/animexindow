@@ -26,6 +26,12 @@ finish() {  # finish <ok|fail> <message>
 
 cd "$REPO_DIR" || finish fail "repo dir $REPO_DIR not found"
 
+# Refuse to rebuild without credentials - otherwise the container would come
+# back up with placeholder tokens and silently fail to log in.
+if [ ! -f "$REPO_DIR/.env" ]; then
+    finish fail ".env is missing in $REPO_DIR - copy .env.example to .env and fill it in"
+fi
+
 # --- pick a compose command (v2 plugin or legacy v1) ---
 if docker compose version >/dev/null 2>&1; then
     DC="docker compose"
@@ -50,10 +56,22 @@ if ! git fetch --prune origin "$BRANCH"; then
 fi
 
 # Keep local runtime files, take the remote code verbatim.
+# Back up local runtime files that must survive a hard reset.
+BAK="$(mktemp -d)"
+for keep in .env channels.json processed_posts.json; do
+    [ -f "$keep" ] && cp -a "$keep" "$BAK/" 2>/dev/null
+done
+
 git stash push --include-untracked -m "auto-update $(date -u +%FT%TZ)" >/dev/null 2>&1
 if ! git reset --hard "origin/$BRANCH"; then
     finish fail "git reset to origin/$BRANCH failed"
 fi
+
+# Restore the protected files after the reset.
+for keep in .env channels.json processed_posts.json; do
+    [ -f "$BAK/$keep" ] && cp -a "$BAK/$keep" "$REPO_DIR/$keep" 2>/dev/null
+done
+rm -rf "$BAK"
 
 NEW_REV="$(git rev-parse --short HEAD)"
 echo "new revision: $NEW_REV"

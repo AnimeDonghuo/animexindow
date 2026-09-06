@@ -7,27 +7,23 @@ services:
       - .:/app
       # Lets /update rebuild + restart this container and prune old images.
       - /var/run/docker.sock:/var/run/docker.sock
+    # ALL secrets live in .env (git-ignored) so that `git reset --hard`
+    # and /update can NEVER overwrite your real tokens again.
+    env_file:
+      - .env
     environment:
-      - API_ID=123456
-      - API_HASH=your_api_hash_here
-      - BOT_TOKEN=your_bot_token_here
-      - CHANNEL_ID=-1003966911002
+      - CHANNEL_ID=${CHANNEL_ID:--1003966911002}
       # Extra channels for the poster card (comma separated)
-      - EXTRA_CHANNELS=-1002689890343,-1002377422812
-
-      # --- MongoDB (episode/quality state survives container rebuilds) ---
-      # SECURITY: do NOT commit real credentials. Put the real URI in a local
-      # .env file (already git-ignored) as MONGO_URI=... and it is read here.
-      - MONGO_URI=${MONGO_URI}
-      - MONGO_DB=animexin
-      - MONGO_COLL=episodes
+      - EXTRA_CHANNELS=${EXTRA_CHANNELS:-}
+      - MONGO_DB=${MONGO_DB:-animexin}
+      - MONGO_COLL=${MONGO_COLL:-episodes}
 
       # --- self-update ---
       - REPO_DIR=/app
       - UPDATE_BRANCH=arena/01a0749f-animexindow
       - COMPOSE_SERVICE=telegram_bot
       # Telegram user ids allowed to run /update (comma separated, blank = all)
-      - ADMINS=
+      - ADMINS=${ADMINS:-}
 
       - TZ=Asia/Jakarta
       - SCHEDULE_TIME=17:00
